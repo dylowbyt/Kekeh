@@ -1,17 +1,9 @@
-import { downloadContentFromMessage, getContentType } from '@whiskeysockets/baileys';
-import sharp from 'sharp';
-import fs from 'fs';
+const { MessageMedia } = require('whatsapp-web.js');
+const sharp = require('sharp');
 
-const TMP_DIR = './tmp';
-if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
-
-async function downloadMedia(message, mediaType) {
-  const stream = await downloadContentFromMessage(message, mediaType);
-  const chunks = [];
-  for await (const chunk of stream) chunks.push(chunk);
-  return Buffer.concat(chunks);
-}
-
+/**
+ * Konversi buffer gambar ke WebP stiker 512x512
+ */
 async function toStickerWebp(buffer) {
   return sharp(buffer)
     .resize(512, 512, {
@@ -22,55 +14,63 @@ async function toStickerWebp(buffer) {
     .toBuffer();
 }
 
-export async function handleSticker(sock, msg, jid) {
+/**
+ * Handler fitur stiker
+ * @param {import('whatsapp-web.js').Message} msg
+ * @param {import('whatsapp-web.js').Client} client
+ */
+async function handleSticker(msg, client) {
   try {
-    let targetMessage = null;
-    let mediaType = null;
+    let media = null;
 
-    const msgType = getContentType(msg.message);
-
-    // Kasus 1: Pesan gambar/video langsung dengan caption /stiker
-    if (msgType === 'imageMessage') {
-      targetMessage = msg.message.imageMessage;
-      mediaType = 'image';
-    } else if (msgType === 'videoMessage') {
-      targetMessage = msg.message.videoMessage;
-      mediaType = 'video';
+    // Kasus 1: Pesan ini sendiri punya media (gambar/video + caption /stiker)
+    if (msg.hasMedia) {
+      media = await msg.downloadMedia();
     }
 
-    // Kasus 2: Reply ke gambar/video
-    const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-    if (!targetMessage && quotedMsg) {
-      const quotedType = getContentType(quotedMsg);
-      if (quotedType === 'imageMessage') {
-        targetMessage = quotedMsg.imageMessage;
-        mediaType = 'image';
-      } else if (quotedType === 'videoMessage') {
-        targetMessage = quotedMsg.videoMessage;
-        mediaType = 'video';
+    // Kasus 2: Reply ke pesan yang punya media
+    if (!media && msg.hasQuotedMsg) {
+      const quoted = await msg.getQuotedMessage();
+      if (quoted.hasMedia) {
+        media = await quoted.downloadMedia();
       }
     }
 
-    if (!targetMessage || !mediaType) {
+    if (!media) {
       return {
         success: false,
         error: 'Kirim gambar dengan caption */stiker*, atau reply gambar dengan */stiker*! 📸',
       };
     }
 
-    const buffer = await downloadMedia(targetMessage, mediaType);
-
-    let stickerBuffer;
-    try {
-      stickerBuffer = await toStickerWebp(buffer);
-    } catch (e) {
-      return { success: false, error: 'Format gambar tidak didukung. Coba gambar lain!' };
+    // Hanya support gambar
+    if (!media.mimetype.startsWith('image/')) {
+      return {
+        success: false,
+        error: 'Hanya gambar yang bisa dijadikan stiker (JPG, PNG, GIF, WebP).',
+      };
     }
 
-    await sock.sendMessage(jid, { sticker: stickerBuffer });
+    // Konversi ke buffer → WebP
+    const inputBuffer = Buffer.from(media.data, 'base64');
+    const stickerBuffer = await toStickerWebp(inputBuffer);
+
+    // Buat MessageMedia dari buffer WebP
+    const stickerMedia = new MessageMedia(
+      'image/webp',
+      stickerBuffer.toString('base64'),
+      'sticker.webp'
+    );
+
+    // Kirim sebagai stiker
+    const chat = await msg.getChat();
+    await chat.sendMessage(stickerMedia, { sendMediaAsSticker: true });
+
     return { success: true };
   } catch (err) {
     console.error('❌ Sticker error:', err?.message || err);
     return { success: false, error: 'Gagal membuat stiker. Coba lagi!' };
   }
 }
+
+module.exports = { handleSticker };
