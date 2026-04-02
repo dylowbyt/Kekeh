@@ -1,202 +1,202 @@
-import 'dotenv/config';
-import {
-  makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-  makeInMemoryStore,
-  getContentType,
-} from '@whiskeysockets/baileys';
-import pino from 'pino';
-import qrcode from 'qrcode-terminal';
-import NodeCache from 'node-cache';
-import fs from 'fs';
-import { handleSticker } from './features/sticker.js';
-import { getAIResponse } from './features/ai.js';
+require('dotenv').config();
 
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
+const NodeCache = require('node-cache');
+const { getAIResponse } = require('./features/ai');
+const { handleSticker } = require('./features/sticker');
+
+// ─── Config ───────────────────────────────────────────────────────────────────
 const BOT_NAME = process.env.BOT_NAME || 'WA AI Bot';
+
+// History percakapan per user (TTL: 1 jam)
 const chatHistory = new NodeCache({ stdTTL: 3600 });
-const SESSION_DIR = './session';
-if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
 
-const logger = pino({ level: 'silent' });
-const store = makeInMemoryStore({ logger });
+// ─── WhatsApp Client ──────────────────────────────────────────────────────────
+const client = new Client({
+  authStrategy: new LocalAuth({ dataPath: './session' }),
+  puppeteer: {
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process',
+      '--disable-gpu',
+    ],
+  },
+});
 
-function isGroup(jid) { return jid.endsWith('@g.us'); }
-function isFromBot(msg) { return msg.key?.fromMe === true; }
+// ─── QR Code ──────────────────────────────────────────────────────────────────
+client.on('qr', (qr) => {
+  console.log('\n📱 Scan QR Code ini dengan WhatsApp kamu:\n');
+  qrcode.generate(qr, { small: true });
+  console.log('\n⏳ Menunggu scan QR...\n');
+});
 
-function isReplyToBot(msg, botJid) {
-  const ctx = msg.message?.extendedTextMessage?.contextInfo;
-  if (!ctx) return false;
-  return (ctx.participant === botJid || ctx.quotedParticipant === botJid || !!ctx.stanzaId);
+// ─── Ready ────────────────────────────────────────────────────────────────────
+client.on('ready', () => {
+  const info = client.info;
+  console.log('\n✅ Bot terhubung!');
+  console.log(`📞 Nomor  : ${info.wid.user}`);
+  console.log(`👤 Nama   : ${info.pushname}`);
+  console.log(`🤖 Model  : ${process.env.OPENAI_MODEL || 'gpt-4o-mini'}`);
+  console.log('\n💡 Bot siap digunakan!\n');
+});
+
+// ─── Auth Failure ─────────────────────────────────────────────────────────────
+client.on('auth_failure', (msg) => {
+  console.error('❌ Auth gagal:', msg);
+});
+
+// ─── Disconnected ─────────────────────────────────────────────────────────────
+client.on('disconnected', (reason) => {
+  console.log('❌ Bot terputus:', reason);
+  console.log('🔄 Mencoba reconnect...');
+  client.initialize();
+});
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function isGroup(msg) {
+  return msg.from.endsWith('@g.us');
 }
 
-function extractText(msg) {
-  const type = getContentType(msg.message);
-  if (!type) return '';
-  const c = msg.message[type];
-  if (type === 'conversation') return c;
-  if (type === 'extendedTextMessage') return c?.text || '';
-  if (type === 'imageMessage') return c?.caption || '';
-  if (type === 'videoMessage') return c?.caption || '';
-  return '';
+async function sendTyping(msg) {
+  try {
+    const chat = await msg.getChat();
+    await chat.sendStateTyping();
+  } catch {}
 }
 
-async function sendTyping(sock, jid) {
-  try { await sock.sendPresenceUpdate('composing', jid); } catch {}
-}
-
-async function handleCommand(sock, msg, command, args, jid, senderJid) {
+// ─── Command Handler ──────────────────────────────────────────────────────────
+async function handleCommand(msg, command, args) {
   const cmd = command.toLowerCase();
+  const chat = await msg.getChat();
+  const senderId = msg.author || msg.from; // author untuk grup
 
-  if (cmd === 'stiker' || cmd === 'sticker' || cmd === 's') {
-    await sock.sendMessage(jid, { react: { text: '⏳', key: msg.key } });
-    const result = await handleSticker(sock, msg, jid);
-    if (!result.success) {
-      await sock.sendMessage(jid, { text: `❌ ${result.error}` }, { quoted: msg });
-    } else {
-      await sock.sendMessage(jid, { react: { text: '✅', key: msg.key } });
+  switch (cmd) {
+    // ── /stiker ───────────────────────────────────────────────────────────────
+    case 's':
+    case 'stiker':
+    case 'sticker': {
+      await msg.react('⏳');
+      const result = await handleSticker(msg, client);
+      if (result.success) {
+        await msg.react('✅');
+      } else {
+        await msg.reply(`❌ ${result.error}`);
+      }
+      break;
     }
-    return;
-  }
 
-  if (cmd === 'help' || cmd === 'bantuan') {
-    const helpText = `╔══════════════════════╗
+    // ── /help ─────────────────────────────────────────────────────────────────
+    case 'help':
+    case 'bantuan': {
+      const helpText = `╔══════════════════════╗
 ║   🤖 *${BOT_NAME}*
 ╚══════════════════════╝
 
-*📌 Fitur Bot:*
+*📌 Cara Pakai:*
 
 *💬 AI Chat (Private)*
-Langsung ketik pesanmu, bot jawab otomatis!
+Langsung kirim pesan → bot jawab otomatis.
 
 *💬 AI Chat (Grup)*
-Reply pesan bot untuk dapat jawaban AI.
+Reply pesan bot → bot jawab dengan AI.
 
-*🎨 Stiker*
-\`/stiker\` atau \`/s\` — Ubah gambar jadi stiker
+*🎨 Buat Stiker*
+\`/stiker\` atau \`/s\`
 • Kirim gambar + caption \`/stiker\`
 • Atau reply gambar dengan \`/stiker\`
 
-*ℹ️ Lainnya*
+*⚙️ Perintah Lain*
 \`/help\` — Menu ini
-\`/reset\` — Reset riwayat AI
+\`/reset\` — Reset riwayat percakapan AI
 \`/ping\` — Cek bot aktif
 
-_Model: ${process.env.OPENAI_MODEL || 'gpt-4o-mini'}_`;
-    await sock.sendMessage(jid, { text: helpText }, { quoted: msg });
-    return;
-  }
+_Model AI: ${process.env.OPENAI_MODEL || 'gpt-4o-mini'}_`;
+      await msg.reply(helpText);
+      break;
+    }
 
-  if (cmd === 'reset' || cmd === 'clear') {
-    chatHistory.del(senderJid);
-    await sock.sendMessage(jid, { text: '✅ Riwayat percakapan direset!' }, { quoted: msg });
-    return;
-  }
+    // ── /reset ────────────────────────────────────────────────────────────────
+    case 'reset':
+    case 'clear': {
+      chatHistory.del(senderId);
+      await msg.reply('✅ Riwayat percakapanmu sudah direset!');
+      break;
+    }
 
-  if (cmd === 'ping') {
-    const start = Date.now();
-    await sock.sendMessage(jid, { text: `🏓 *Pong!*\n⚡ ${Date.now() - start}ms\n✅ Bot aktif!` }, { quoted: msg });
-    return;
-  }
+    // ── /ping ─────────────────────────────────────────────────────────────────
+    case 'ping': {
+      const start = Date.now();
+      await msg.reply(`🏓 *Pong!*\n⚡ Latency: ${Date.now() - start}ms\n✅ Bot aktif!`);
+      break;
+    }
 
-  await sock.sendMessage(jid, { text: `❓ Perintah \`/${command}\` tidak dikenal. Ketik \`/help\`.` }, { quoted: msg });
+    // ── Unknown ───────────────────────────────────────────────────────────────
+    default: {
+      await msg.reply(`❓ Perintah \`/${command}\` tidak dikenal.\nKetik \`/help\` untuk bantuan.`);
+    }
+  }
 }
 
-async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+// ─── Message Handler ──────────────────────────────────────────────────────────
+client.on('message_create', async (msg) => {
+  try {
+    // Skip pesan dari bot sendiri
+    if (msg.fromMe) return;
+    // Skip status/broadcast
+    if (msg.from === 'status@broadcast') return;
 
-  console.log(`\n🚀 Memulai ${BOT_NAME}...`);
+    const body = (msg.body || '').trim();
+    const group = isGroup(msg);
+    const senderId = msg.author || msg.from;
 
-  const sock = makeWASocket({
-    version,
-    logger,
-    auth: state,
-    printQRInTerminal: false,
-    browser: ['WA AI Bot', 'Chrome', '120.0.0'],
-    syncFullHistory: false,
-  });
-
-  store.bind(sock.ev);
-
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      console.log('\n📱 Scan QR Code ini dengan WhatsApp:\n');
-      qrcode.generate(qr, { small: true });
-      console.log('\n⏳ Menunggu scan...\n');
+    // ── Commands (/...) ───────────────────────────────────────────────────────
+    if (body.startsWith('/')) {
+      const [cmdRaw, ...args] = body.slice(1).split(' ');
+      const command = cmdRaw.trim();
+      if (!command) return;
+      await sendTyping(msg);
+      await handleCommand(msg, command, args);
+      return;
     }
 
-    if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const reconnect = code !== DisconnectReason.loggedOut;
-      console.log(`❌ Terputus (${code}). Reconnect: ${reconnect}`);
-      if (reconnect) {
-        setTimeout(startBot, 5000);
-      } else {
-        fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-        process.exit(0);
-      }
+    // ── AI Chat ───────────────────────────────────────────────────────────────
+    if (group) {
+      // Di grup: hanya jawab jika reply ke pesan bot
+      if (!msg.hasQuotedMsg) return;
+      const quoted = await msg.getQuotedMessage();
+      if (!quoted.fromMe) return; // Quoted bukan dari bot
     }
 
-    if (connection === 'open') {
-      console.log(`\n✅ Bot terhubung!`);
-      console.log(`📞 Nomor: ${sock.user?.id?.split(':')[0]}`);
-      console.log(`🤖 Model: ${process.env.OPENAI_MODEL || 'gpt-4o-mini'}`);
-      console.log(`\n💡 Bot siap!\n`);
+    if (!body) return;
+
+    await sendTyping(msg);
+
+    // Ambil & update history
+    const history = chatHistory.get(senderId) || [];
+    const aiReply = await getAIResponse(body, history, senderId);
+
+    history.push({ role: 'user', content: body });
+    history.push({ role: 'assistant', content: aiReply });
+
+    const maxHistory = parseInt(process.env.MAX_HISTORY || '10') * 2;
+    if (history.length > maxHistory) {
+      history.splice(0, history.length - maxHistory);
     }
-  });
+    chatHistory.set(senderId, history);
 
-  sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-
-    for (const msg of messages) {
-      try {
-        if (isFromBot(msg)) continue;
-        if (!msg.message) continue;
-        const jid = msg.key.remoteJid;
-        if (!jid) continue;
-
-        const group = isGroup(jid);
-        const senderJid = group ? (msg.key.participant || jid) : jid;
-        const botJid = sock.user?.id?.replace(/:\d+@/, '@') || '';
-        const text = extractText(msg).trim();
-
-        if (text.startsWith('/')) {
-          const [cmdRaw, ...args] = text.slice(1).split(' ');
-          const command = cmdRaw.trim();
-          if (!command) continue;
-          await sendTyping(sock, jid);
-          await handleCommand(sock, msg, command, args, jid, senderJid);
-          continue;
-        }
-
-        if (group && !isReplyToBot(msg, botJid)) continue;
-        if (!text) continue;
-
-        await sendTyping(sock, jid);
-        const history = chatHistory.get(senderJid) || [];
-        const aiReply = await getAIResponse(text, history, senderJid);
-
-        history.push({ role: 'user', content: text });
-        history.push({ role: 'assistant', content: aiReply });
-        const maxHistory = parseInt(process.env.MAX_HISTORY || '10') * 2;
-        if (history.length > maxHistory) history.splice(0, history.length - maxHistory);
-        chatHistory.set(senderJid, history);
-
-        await sock.sendMessage(jid, { text: aiReply }, { quoted: msg });
-      } catch (err) {
-        console.error('❌ Error:', err?.message || err);
-      }
-    }
-  });
-}
-
-startBot().catch((err) => {
-  console.error('❌ Fatal:', err);
-  process.exit(1);
+    await msg.reply(aiReply);
+  } catch (err) {
+    console.error('❌ Error handling message:', err?.message || err);
+  }
 });
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+console.log(`\n🚀 Memulai ${BOT_NAME}...`);
+client.initialize();
