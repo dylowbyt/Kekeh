@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "WhatsApp AI Bot with OpenAI & Sticker Feature",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js"
   },

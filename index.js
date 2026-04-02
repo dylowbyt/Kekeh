@@ -1,312 +1,202 @@
-require('dotenv').config();
-const {
+import 'dotenv/config';
+import {
   makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeInMemoryStore,
-  jidDecode,
-  proto,
   getContentType,
-  downloadContentFromMessage,
-} = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const qrcode = require('qrcode-terminal');
-const OpenAI = require('openai');
-const NodeCache = require('node-cache');
-const fs = require('fs');
-const path = require('path');
-const { handleSticker } = require('./features/sticker');
-const { getAIResponse } = require('./features/ai');
+} from '@whiskeysockets/baileys';
+import pino from 'pino';
+import qrcode from 'qrcode-terminal';
+import NodeCache from 'node-cache';
+import fs from 'fs';
+import { handleSticker } from './features/sticker.js';
+import { getAIResponse } from './features/ai.js';
 
-// ─── Config ────────────────────────────────────────────────────────────────────
 const BOT_NAME = process.env.BOT_NAME || 'WA AI Bot';
-
-// Cache untuk conversation history per user (TTL: 1 jam)
 const chatHistory = new NodeCache({ stdTTL: 3600 });
-
-// Pastikan folder session ada
 const SESSION_DIR = './session';
 if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
 
-// ─── Logger ────────────────────────────────────────────────────────────────────
 const logger = pino({ level: 'silent' });
-
-// ─── In-memory store ──────────────────────────────────────────────────────────
 const store = makeInMemoryStore({ logger });
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-function getJid(jid) {
-  return jidDecode(jid)?.user + '@s.whatsapp.net';
-}
+function isGroup(jid) { return jid.endsWith('@g.us'); }
+function isFromBot(msg) { return msg.key?.fromMe === true; }
 
-function isGroup(jid) {
-  return jid.endsWith('@g.us');
-}
-
-function isFromBot(msg) {
-  return msg.key?.fromMe === true;
-}
-
-/**
- * Cek apakah pesan adalah reply ke bot (di grup)
- */
 function isReplyToBot(msg, botJid) {
   const ctx = msg.message?.extendedTextMessage?.contextInfo;
   if (!ctx) return false;
-  const participant = ctx.participant || '';
-  const quotedParticipant = ctx.quotedParticipant || '';
-  return (
-    participant === botJid ||
-    quotedParticipant === botJid ||
-    ctx.stanzaId !== undefined
-  );
+  return (ctx.participant === botJid || ctx.quotedParticipant === botJid || !!ctx.stanzaId);
 }
 
-/**
- * Ekstrak teks dari berbagai tipe pesan
- */
 function extractText(msg) {
   const type = getContentType(msg.message);
   if (!type) return '';
-  const content = msg.message[type];
-  if (type === 'conversation') return content;
-  if (type === 'extendedTextMessage') return content?.text || '';
-  if (type === 'imageMessage') return content?.caption || '';
-  if (type === 'videoMessage') return content?.caption || '';
+  const c = msg.message[type];
+  if (type === 'conversation') return c;
+  if (type === 'extendedTextMessage') return c?.text || '';
+  if (type === 'imageMessage') return c?.caption || '';
+  if (type === 'videoMessage') return c?.caption || '';
   return '';
 }
 
-/**
- * Kirim pesan dengan react (opsional)
- */
 async function sendTyping(sock, jid) {
-  await sock.sendPresenceUpdate('composing', jid);
+  try { await sock.sendPresenceUpdate('composing', jid); } catch {}
 }
 
-// ─── Command Handler ──────────────────────────────────────────────────────────
 async function handleCommand(sock, msg, command, args, jid, senderJid) {
-  const cmdLower = command.toLowerCase();
+  const cmd = command.toLowerCase();
 
-  switch (cmdLower) {
-    // ── /sticker ──────────────────────────────────────────────────────────────
-    case 'stiker':
-    case 'sticker':
-    case 's': {
-      await sock.sendMessage(jid, { react: { text: '⏳', key: msg.key } });
-      const result = await handleSticker(sock, msg, jid);
-      if (!result.success) {
-        await sock.sendMessage(
-          jid,
-          { text: `❌ ${result.error}` },
-          { quoted: msg }
-        );
-      }
-      break;
+  if (cmd === 'stiker' || cmd === 'sticker' || cmd === 's') {
+    await sock.sendMessage(jid, { react: { text: '⏳', key: msg.key } });
+    const result = await handleSticker(sock, msg, jid);
+    if (!result.success) {
+      await sock.sendMessage(jid, { text: `❌ ${result.error}` }, { quoted: msg });
+    } else {
+      await sock.sendMessage(jid, { react: { text: '✅', key: msg.key } });
     }
+    return;
+  }
 
-    // ── /help ─────────────────────────────────────────────────────────────────
-    case 'help':
-    case 'bantuan': {
-      const helpText = `╔══════════════════════╗
-║   🤖 *${BOT_NAME}*   ║
+  if (cmd === 'help' || cmd === 'bantuan') {
+    const helpText = `╔══════════════════════╗
+║   🤖 *${BOT_NAME}*
 ╚══════════════════════╝
 
 *📌 Fitur Bot:*
 
 *💬 AI Chat (Private)*
-Langsung ketik pesanmu, bot akan menjawab otomatis!
+Langsung ketik pesanmu, bot jawab otomatis!
 
 *💬 AI Chat (Grup)*
-Reply pesan bot untuk mendapatkan jawaban AI.
+Reply pesan bot untuk dapat jawaban AI.
 
 *🎨 Stiker*
-\`/stiker\` atau \`/s\` - Ubah gambar/video menjadi stiker
-Caranya: Kirim gambar/video dengan caption \`/stiker\`, atau reply gambar/video dengan \`/stiker\`
+\`/stiker\` atau \`/s\` — Ubah gambar jadi stiker
+• Kirim gambar + caption \`/stiker\`
+• Atau reply gambar dengan \`/stiker\`
 
 *ℹ️ Lainnya*
-\`/help\` - Tampilkan menu bantuan ini
-\`/reset\` - Reset riwayat percakapan AI
-\`/ping\` - Cek apakah bot aktif
+\`/help\` — Menu ini
+\`/reset\` — Reset riwayat AI
+\`/ping\` — Cek bot aktif
 
-_Bot berjalan dengan OpenAI ${process.env.OPENAI_MODEL || 'gpt-4o-mini'}_`;
-
-      await sock.sendMessage(jid, { text: helpText }, { quoted: msg });
-      break;
-    }
-
-    // ── /reset ────────────────────────────────────────────────────────────────
-    case 'reset':
-    case 'clear': {
-      chatHistory.del(senderJid);
-      await sock.sendMessage(
-        jid,
-        { text: '✅ Riwayat percakapan kamu telah direset!' },
-        { quoted: msg }
-      );
-      break;
-    }
-
-    // ── /ping ─────────────────────────────────────────────────────────────────
-    case 'ping': {
-      const start = Date.now();
-      await sock.sendMessage(
-        jid,
-        { text: `🏓 *Pong!*\n⚡ Latency: ${Date.now() - start}ms\n✅ Bot aktif!` },
-        { quoted: msg }
-      );
-      break;
-    }
-
-    // ── Unknown command ───────────────────────────────────────────────────────
-    default: {
-      await sock.sendMessage(
-        jid,
-        {
-          text: `❓ Perintah \`/${command}\` tidak dikenal.\nKetik \`/help\` untuk melihat daftar perintah.`,
-        },
-        { quoted: msg }
-      );
-    }
+_Model: ${process.env.OPENAI_MODEL || 'gpt-4o-mini'}_`;
+    await sock.sendMessage(jid, { text: helpText }, { quoted: msg });
+    return;
   }
+
+  if (cmd === 'reset' || cmd === 'clear') {
+    chatHistory.del(senderJid);
+    await sock.sendMessage(jid, { text: '✅ Riwayat percakapan direset!' }, { quoted: msg });
+    return;
+  }
+
+  if (cmd === 'ping') {
+    const start = Date.now();
+    await sock.sendMessage(jid, { text: `🏓 *Pong!*\n⚡ ${Date.now() - start}ms\n✅ Bot aktif!` }, { quoted: msg });
+    return;
+  }
+
+  await sock.sendMessage(jid, { text: `❓ Perintah \`/${command}\` tidak dikenal. Ketik \`/help\`.` }, { quoted: msg });
 }
 
-// ─── Main Bot Logic ───────────────────────────────────────────────────────────
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
   console.log(`\n🚀 Memulai ${BOT_NAME}...`);
-  console.log(`📦 Baileys version: ${version.join('.')}\n`);
 
   const sock = makeWASocket({
     version,
     logger,
     auth: state,
-    printQRInTerminal: false, // kita handle sendiri supaya lebih cantik
+    printQRInTerminal: false,
     browser: ['WA AI Bot', 'Chrome', '120.0.0'],
     syncFullHistory: false,
-    generateHighQualityLinkPreview: true,
   });
 
   store.bind(sock.ev);
 
-  // ── QR Code ──────────────────────────────────────────────────────────────
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      console.log('\n📱 Scan QR Code berikut dengan WhatsApp kamu:\n');
+      console.log('\n📱 Scan QR Code ini dengan WhatsApp:\n');
       qrcode.generate(qr, { small: true });
-      console.log('\n⏳ Menunggu scan QR...\n');
+      console.log('\n⏳ Menunggu scan...\n');
     }
 
     if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-
-      console.log(
-        `❌ Koneksi terputus. Status: ${statusCode}. Reconnect: ${shouldReconnect}`
-      );
-
-      if (shouldReconnect) {
-        console.log('🔄 Mencoba reconnect dalam 5 detik...');
+      const code = lastDisconnect?.error?.output?.statusCode;
+      const reconnect = code !== DisconnectReason.loggedOut;
+      console.log(`❌ Terputus (${code}). Reconnect: ${reconnect}`);
+      if (reconnect) {
         setTimeout(startBot, 5000);
       } else {
-        console.log('🚪 Bot logout. Hapus folder session/ lalu restart.');
-        // Hapus session agar QR muncul lagi
         fs.rmSync(SESSION_DIR, { recursive: true, force: true });
         process.exit(0);
       }
     }
 
     if (connection === 'open') {
-      const botNumber = sock.user?.id;
       console.log(`\n✅ Bot terhubung!`);
-      console.log(`📞 Nomor Bot: ${botNumber?.split(':')[0]}`);
-      console.log(`🤖 Model AI: ${process.env.OPENAI_MODEL || 'gpt-4o-mini'}`);
-      console.log(`\n💡 Bot siap digunakan!\n`);
+      console.log(`📞 Nomor: ${sock.user?.id?.split(':')[0]}`);
+      console.log(`🤖 Model: ${process.env.OPENAI_MODEL || 'gpt-4o-mini'}`);
+      console.log(`\n💡 Bot siap!\n`);
     }
   });
 
-  // ── Save credentials ──────────────────────────────────────────────────────
   sock.ev.on('creds.update', saveCreds);
 
-  // ── Message Handler ───────────────────────────────────────────────────────
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
     for (const msg of messages) {
       try {
-        // Skip pesan dari bot sendiri
         if (isFromBot(msg)) continue;
-        // Skip jika tidak ada pesan
         if (!msg.message) continue;
-
         const jid = msg.key.remoteJid;
         if (!jid) continue;
 
         const group = isGroup(jid);
-        const senderJid = group
-          ? msg.key.participant || msg.key.remoteJid
-          : jid;
-
-        const botJid = sock.user?.id?.replace(/:\d+/, '') + '@s.whatsapp.net';
+        const senderJid = group ? (msg.key.participant || jid) : jid;
+        const botJid = sock.user?.id?.replace(/:\d+@/, '@') || '';
         const text = extractText(msg).trim();
 
-        // ── Command Handler (/...) ─────────────────────────────────────────
         if (text.startsWith('/')) {
           const [cmdRaw, ...args] = text.slice(1).split(' ');
           const command = cmdRaw.trim();
           if (!command) continue;
-
           await sendTyping(sock, jid);
           await handleCommand(sock, msg, command, args, jid, senderJid);
           continue;
         }
 
-        // ── AI Chat Logic ──────────────────────────────────────────────────
-        if (group) {
-          // Di grup: hanya jawab kalau pesan adalah reply ke bot
-          const isReply = isReplyToBot(msg, botJid);
-          if (!isReply) continue;
-        }
-
-        // Private: semua pesan dijawab AI
+        if (group && !isReplyToBot(msg, botJid)) continue;
         if (!text) continue;
 
         await sendTyping(sock, jid);
-
-        // Ambil history chat
         const history = chatHistory.get(senderJid) || [];
-
-        // Dapatkan respons AI
         const aiReply = await getAIResponse(text, history, senderJid);
 
-        // Update history
         history.push({ role: 'user', content: text });
         history.push({ role: 'assistant', content: aiReply });
-
-        // Batasi history agar tidak terlalu panjang
         const maxHistory = parseInt(process.env.MAX_HISTORY || '10') * 2;
-        if (history.length > maxHistory) {
-          history.splice(0, history.length - maxHistory);
-        }
+        if (history.length > maxHistory) history.splice(0, history.length - maxHistory);
         chatHistory.set(senderJid, history);
 
-        // Kirim balasan
         await sock.sendMessage(jid, { text: aiReply }, { quoted: msg });
       } catch (err) {
-        console.error('❌ Error handling message:', err?.message || err);
+        console.error('❌ Error:', err?.message || err);
       }
     }
   });
-
-  return sock;
 }
 
-// ─── Start ────────────────────────────────────────────────────────────────────
 startBot().catch((err) => {
-  console.error('❌ Fatal error:', err);
+  console.error('❌ Fatal:', err);
   process.exit(1);
 });
